@@ -8,12 +8,14 @@
  * Camera Views: 1=Top, 2=Side, 3=Front, 0=Free
  * Mouse: Click+Drag for free camera rotation
  * Animations (after collecting all items): Z, X, C, V
+ * B: Toggle debug visualization
  * R: Restart game
  * ESC: Exit
  */
 
 // macOS uses different include paths
 #ifdef __APPLE__
+#define GL_SILENCE_DEPRECATION
 #include <GLUT/glut.h>
 #include <OpenGL/gl.h>
 #include <OpenGL/glu.h>
@@ -29,6 +31,9 @@
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 
 // ==================== CONSTANTS ====================
 const int WINDOW_WIDTH = 1200;
@@ -37,6 +42,7 @@ const float GROUND_SIZE = 50.0f;
 const float WALL_HEIGHT = 10.0f;
 const float PLAYER_SPEED = 0.3f;
 const int GAME_TIME = 120; // seconds
+const float COLLECTION_RADIUS = 2.0f; // Increased for easier collection
 
 // ==================== STRUCTURES ====================
 struct Vector3 {
@@ -92,6 +98,98 @@ float globalRotation = 0.0f;
 
 bool keys[256] = {false};
 bool specialKeys[256] = {false};
+bool debugMode = false;
+
+// ==================== LOGGING SYSTEM ====================
+class GameLogger {
+private:
+    std::ofstream logFile;
+    bool enabled;
+    int frameCounter;
+    
+public:
+    GameLogger() : enabled(true), frameCounter(0) {
+        logFile.open("game_debug.log", std::ios::out | std::ios::trunc);
+        if (logFile.is_open()) {
+            logFile << "=== GAME DEBUG LOG ===" << std::endl;
+            logFile << "Timestamp: " << time(NULL) << std::endl;
+            logFile << "======================" << std::endl << std::endl;
+        }
+    }
+    
+    ~GameLogger() {
+        if (logFile.is_open()) {
+            logFile.close();
+        }
+    }
+    
+    void log(const std::string& category, const std::string& message) {
+        if (!enabled || !logFile.is_open()) return;
+        
+        logFile << "[" << category << "] " << message << std::endl;
+        logFile.flush();
+        std::cout << "[" << category << "] " << message << std::endl;
+    }
+    
+    void logVector(const std::string& label, const Vector3& v) {
+        std::stringstream ss;
+        ss << label << " (" << std::fixed << std::setprecision(2) 
+           << v.x << ", " << v.y << ", " << v.z << ")";
+        log("VECTOR", ss.str());
+    }
+    
+    void logCollectiblePositions(const std::vector<Collectible>& collectibles) {
+        log("INIT", "=== Collectible Positions ===");
+        for (size_t i = 0; i < collectibles.size(); i++) {
+            std::stringstream ss;
+            ss << "Collectible " << i << " [P" << collectibles[i].platform << "] at ("
+               << std::fixed << std::setprecision(2)
+               << collectibles[i].position.x << ", "
+               << collectibles[i].position.y << ", "
+               << collectibles[i].position.z << ")";
+            log("COLLECTIBLE", ss.str());
+        }
+        
+        // Check for overlaps
+        for (size_t i = 0; i < collectibles.size(); i++) {
+            for (size_t j = i + 1; j < collectibles.size(); j++) {
+                if (collectibles[i].platform == collectibles[j].platform) {
+                    float dx = collectibles[i].position.x - collectibles[j].position.x;
+                    float dy = collectibles[i].position.y - collectibles[j].position.y;
+                    float dz = collectibles[i].position.z - collectibles[j].position.z;
+                    float dist = sqrt(dx*dx + dy*dy + dz*dz);
+                    if (dist < 1.0f) {
+                        std::stringstream ss;
+                        ss << "WARNING: Collectibles " << i << " and " << j 
+                           << " are too close! Distance: " << std::fixed << std::setprecision(2) << dist;
+                        log("OVERLAP", ss.str());
+                    }
+                }
+            }
+        }
+    }
+    
+    void logCollectionAttempt(int index, float dist) {
+        std::stringstream ss;
+        ss << "Attempt to collect #" << index << " at distance " 
+           << std::fixed << std::setprecision(2) << dist;
+        log("COLLECT", ss.str());
+    }
+    
+    void logPlayerMovement(const Vector3& pos) {
+        if (frameCounter++ % 60 == 0) { // Log every second
+            std::stringstream ss;
+            ss << "Player at (" << std::fixed << std::setprecision(2)
+               << pos.x << ", " << pos.y << ", " << pos.z << ")";
+            log("PLAYER", ss.str());
+        }
+    }
+    
+    void setEnabled(bool enable) { enabled = enable; }
+};
+
+// Global logger instance
+GameLogger gameLogger;
 
 // ==================== UTILITY FUNCTIONS ====================
 float distance(Vector3 a, Vector3 b) {
@@ -132,6 +230,29 @@ void drawCone(float radius, float height, Color color) {
 void drawTorus(float innerRadius, float outerRadius, Color color) {
     glColor3f(color.r, color.g, color.b);
     glutSolidTorus(innerRadius, outerRadius, 16, 16);
+}
+
+// ==================== DEBUG DRAWING ====================
+void drawDebugSphere(Vector3 pos, float radius, Color color) {
+    glPushMatrix();
+    glDisable(GL_LIGHTING);
+    glColor3f(color.r, color.g, color.b);
+    glTranslatef(pos.x, pos.y, pos.z);
+    glutWireSphere(radius, 12, 12);
+    glEnable(GL_LIGHTING);
+    glPopMatrix();
+}
+
+void drawDebugLine(Vector3 from, Vector3 to, Color color) {
+    glDisable(GL_LIGHTING);
+    glColor3f(color.r, color.g, color.b);
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glVertex3f(from.x, from.y, from.z);
+    glVertex3f(to.x, to.y, to.z);
+    glEnd();
+    glLineWidth(1.0f);
+    glEnable(GL_LIGHTING);
 }
 
 // ==================== GAME OBJECTS ====================
@@ -244,23 +365,30 @@ void drawPlayer() {
 
 // Platform (2 primitives each)
 void drawPlatform(Platform& platform) {
+    const float heightScale = 0.5f;
+    float reducedHeight = platform.size.y * heightScale;
+
     glPushMatrix();
     glTranslatef(platform.position.x, platform.position.y, platform.position.z);
-    
+
     // Base
     glPushMatrix();
-    glScalef(platform.size.x, platform.size.y, platform.size.z);
+    glScalef(platform.size.x, reducedHeight, platform.size.z);
     drawCube(1, platform.color);
     glPopMatrix();
-    
-    // Top
+
+    // Top section
     glPushMatrix();
-    glTranslatef(0, platform.size.y/2 + 0.1f, 0);
-    glScalef(platform.size.x * 1.1f, 0.2f, platform.size.z * 1.1f);
-    Color topColor(platform.color.r * 0.8f, platform.color.g * 0.8f, platform.color.b * 0.8f);
+    glTranslatef(0, reducedHeight / 2 + 0.1f, 0);
+    glScalef(platform.size.x, 0.2f, platform.size.z);
+    Color topColor(
+        platform.color.r * 0.8f,
+        platform.color.g * 0.8f,
+        platform.color.b * 0.8f
+    );
     drawCube(1, topColor);
     glPopMatrix();
-    
+
     glPopMatrix();
 }
 
@@ -291,15 +419,12 @@ void drawCollectible(Vector3 pos) {
 // Platform 1: Lantern (5 primitives) - Rotation
 void drawLantern(Platform& platform) {
     glPushMatrix();
-    // Position above the platform
     glTranslatef(platform.position.x, platform.position.y + 3, platform.position.z);
 
     float rot = 0.0f;
     float bob = 0.0f;
-    // Use a fixed color for the lantern so rotation does not change its color
     const float fixedGlow = 0.84f;
     if (platform.animationActive) {
-        // fast rotation and vertical bob (no color pulsing)
         rot = platform.animationValue * 3.0f;
         bob = 0.25f * sin(platform.animationValue * 0.05f);
     }
@@ -309,7 +434,7 @@ void drawLantern(Platform& platform) {
     // Top
     drawCylinder(0.3f, 0.5f, Color(0.6f, 0.3f, 0.0f));
 
-    // Middle sphere (fixed color)
+    // Middle sphere
     glPushMatrix();
     glTranslatef(0, 0.8f, 0);
     drawSphere(0.6f, Color(1.0f, fixedGlow, 0.0f));
@@ -343,7 +468,6 @@ void drawPagoda(Platform& platform) {
     glTranslatef(platform.position.x, platform.position.y + 2, platform.position.z);
 
     if (platform.animationActive) {
-        // Asymmetric breathing scale and slight tilt for pagoda
         float s1 = 1.0f + 0.35f * sin(platform.animationValue * 0.035f);
         float s2 = 1.0f + 0.15f * sin(platform.animationValue * 0.04f + 1.0f);
         float s3 = 1.0f + 0.25f * sin(platform.animationValue * 0.03f + 2.0f);
@@ -396,13 +520,12 @@ void drawPagoda(Platform& platform) {
 // Platform 3: Statue (7 primitives) - Translation
 void drawStatue(Platform& platform) {
     glPushMatrix();
-    // We'll orbit the statue slightly around its platform center when animating
     float orbitX = 0.0f;
     float orbitZ = 0.0f;
     float offsetY = 0.0f;
     float rotY = 0.0f;
     if (platform.animationActive) {
-        float ang = platform.animationValue * 3.14159f / 180.0f; // radians
+        float ang = platform.animationValue * 3.14159f / 180.0f;
         float radius = 0.6f;
         orbitX = radius * cos(ang * 0.6f);
         orbitZ = radius * sin(ang * 0.6f);
@@ -464,11 +587,10 @@ void drawWeaponRack(Platform& platform) {
     glPushMatrix();
     glTranslatef(platform.position.x, platform.position.y + 2, platform.position.z);
 
-    // Sword swing angle and color change when active
     float swing = 0.0f;
     Color weaponColor(0.7f, 0.7f, 0.8f);
     if (platform.animationActive) {
-        swing = sin(platform.animationValue * 0.06f) * 25.0f; // swing degrees
+        swing = sin(platform.animationValue * 0.06f) * 25.0f;
         float r = 0.4f + 0.6f * fabs(sin(platform.animationValue * 0.03f));
         float g = 0.4f + 0.6f * fabs(sin(platform.animationValue * 0.03f + 2.0f));
         float b = 0.4f + 0.6f * fabs(sin(platform.animationValue * 0.03f + 4.0f));
@@ -487,14 +609,14 @@ void drawWeaponRack(Platform& platform) {
     drawCylinder(0.1f, 1.5f, Color(0.3f, 0.2f, 0.1f));
     glPopMatrix();
 
-    // Sword 1 (left) - swings
+    // Sword 1 (left)
     glPushMatrix();
     glTranslatef(-0.3f, 1.2f, 0);
     glRotatef(30 + swing, 0, 0, 1);
     drawCylinder(0.05f, 1.5f, weaponColor);
     glPopMatrix();
 
-    // Sword 2 (right) - swings opposite
+    // Sword 2 (right)
     glPushMatrix();
     glTranslatef(0.3f, 1.2f, 0);
     glRotatef(-30 - swing, 0, 0, 1);
@@ -563,8 +685,14 @@ void renderHUD() {
     }
     
     // Controls
-    renderText(10, 50, "WASD: Move | 1/2/3: Views | Z/X/C/V: Animations");
-    renderText(10, 30, "Mouse: Camera | R: Restart | ESC: Exit");
+    renderText(10, 70, "WASD: Move | 1/2/3: Views | Z/X/C/V: Animations");
+    renderText(10, 50, "Mouse: Camera | B: Debug | R: Restart | ESC: Exit");
+    
+    // Debug mode indicator
+    if (debugMode) {
+        glColor3f(0, 1, 0);
+        renderText(10, 30, "DEBUG MODE ON - Check game_debug.log", GLUT_BITMAP_HELVETICA_18);
+    }
     
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_LIGHTING);
@@ -651,6 +779,10 @@ void renderGameOverScreen() {
 // ==================== GAME LOGIC ====================
 void initGame() {
     srand(time(NULL));
+    system("killall afplay 2>/dev/null"); // Stop any previous music
+    system("afplay /System/Library/Sounds/Funk.aiff --loop &");
+    
+    gameLogger.log("GAME", "===== GAME INITIALIZATION =====");
     
     platforms.clear();
     platforms.push_back(Platform(Vector3(-15, 0.5, -15), Vector3(5, 1, 5), Color(0.8f, 0.2f, 0.2f), 0));
@@ -659,53 +791,79 @@ void initGame() {
     platforms.push_back(Platform(Vector3(15, 0.5, 15), Vector3(5, 1, 5), Color(0.8f, 0.8f, 0.2f), 3));
     
     collectibles.clear();
+    
+    // FIXED: Proper spacing using equilateral triangle vertices (guaranteed no overlap)
     for (size_t i = 0; i < platforms.size(); i++) {
+        Platform& p = platforms[i];
+        float platformRadius = (p.size.x / 2.0f) * 0.7f; // Stay within platform
+        float collectY = p.position.y + p.size.y * 0.5f * 0.5f + 1.5f; // Higher above platform
+        
+        // Place 3 collectibles at vertices of equilateral triangle
+        float angleOffset = (M_PI / 3.0f) * i; // Different rotation per platform
+        
         for (int j = 0; j < 3; j++) {
-            float offsetX = (rand() % 3 - 1) * 1.5f;
-            float offsetZ = (rand() % 3 - 1) * 1.5f;
-            // Place collectibles slightly above the top surface of the platform so they're visible
-            float collectY = platforms[i].position.y + platforms[i].size.y/2.0f + 0.6f;
-            Vector3 pos(platforms[i].position.x + offsetX, collectY, platforms[i].position.z + offsetZ);
+            float angle = (2.0f * M_PI * j / 3.0f) + angleOffset;
+            float offsetX = cos(angle) * platformRadius;
+            float offsetZ = sin(angle) * platformRadius;
+            
+            Vector3 pos(p.position.x + offsetX, collectY, p.position.z + offsetZ);
             collectibles.push_back(Collectible(pos, i));
         }
     }
+    
+    gameLogger.logCollectiblePositions(collectibles);
     
     gameState = PLAYING;
     gameTimeRemaining = GAME_TIME;
     playerPos = Vector3(0, 0.5, 0);
     playerRotation = 0;
+    
+    gameLogger.log("GAME", "Initialization complete");
 }
 
 void checkCollectibles() {
-    for (auto& c : collectibles) {
+    for (size_t i = 0; i < collectibles.size(); i++) {
+        auto& c = collectibles[i];
         if (!c.collected) {
             float dist = distance(playerPos, c.position);
-            // collect when close enough
-            if (dist < 1.5f) {
+            
+            if (dist < COLLECTION_RADIUS) {
                 c.collected = true;
-                std::cout << "Collectible picked up!" << std::endl;
+                system("afplay /System/Library/Sounds/Pop.aiff &");
+                
+                std::stringstream ss;
+                ss << "Collectible #" << i << " picked up! Distance: " 
+                   << std::fixed << std::setprecision(2) << dist;
+                gameLogger.log("SUCCESS", ss.str());
+            } else if (dist < COLLECTION_RADIUS * 1.5f && debugMode) {
+                gameLogger.logCollectionAttempt(i, dist);
             }
         }
     }
     
+    // Check platform completion
     for (size_t i = 0; i < platforms.size(); i++) {
         bool allCollected = true;
+        int collectedCount = 0;
         for (const auto& c : collectibles) {
-            if (c.platform == i && !c.collected) {
-                allCollected = false;
-                break;
+            if (c.platform == (int)i) {
+                if (c.collected) collectedCount++;
+                else allCollected = false;
             }
         }
-        // If platform was not complete and now is, mark complete and auto-enable animation
+        
         if (!platforms[i].allCollected && allCollected) {
             platforms[i].allCollected = true;
-            platforms[i].animationActive = true; // auto-enable animation on completion
+            platforms[i].animationActive = true;
+            
+            std::stringstream ss;
+            ss << "Platform " << (i+1) << " completed! (" << collectedCount << "/3 items)";
+            gameLogger.log("PLATFORM", ss.str());
             std::cout << "Platform " << (i+1) << " completed. Animation auto-enabled." << std::endl;
-        } else {
-            platforms[i].allCollected = allCollected;
         }
     }
     
+    // Check win condition
     bool allComplete = true;
     for (const auto& p : platforms) {
         if (!p.allCollected) {
@@ -715,6 +873,8 @@ void checkCollectibles() {
     }
     if (allComplete && gameState == PLAYING) {
         gameState = WIN;
+        system("afplay /System/Library/Sounds/Glass.aiff &");
+        gameLogger.log("GAME", "PLAYER WON!");
         std::cout << "YOU WIN!" << std::endl;
     }
 }
@@ -781,6 +941,26 @@ void display() {
         }
     }
     
+    // DEBUG VISUALIZATION
+    if (debugMode) {
+        // Show collection radius around player
+        drawDebugSphere(playerPos, COLLECTION_RADIUS, Color(0, 1, 0));
+        
+        // Draw lines to nearby collectibles
+        for (const auto& c : collectibles) {
+            if (!c.collected) {
+                float dist = distance(playerPos, c.position);
+                if (dist < 5.0f) {
+                    Color lineColor = dist < COLLECTION_RADIUS ? Color(0, 1, 0) : Color(1, 1, 0);
+                    drawDebugLine(playerPos, c.position, lineColor);
+                    
+                    // Draw sphere around each collectible
+                    drawDebugSphere(c.position, 0.5f, Color(1, 0.5f, 0));
+                }
+            }
+        }
+    }
+    
     // Draw HUD
     renderHUD();
     
@@ -814,6 +994,8 @@ void update(int value) {
             timeAccumulator = 0;
             if (gameTimeRemaining <= 0) {
                 gameState = GAME_OVER;
+                gameLogger.log("GAME", "TIME UP - GAME OVER");
+                system("afplay /System/Library/Sounds/Basso.aiff &");
             }
         }
     }
@@ -824,13 +1006,12 @@ void update(int value) {
     
     for (auto& platform : platforms) {
         if (platform.animationActive) {
-            // Use different speeds per platform (animationType)
             float speed = 2.0f;
             switch (platform.animationType) {
-                case 0: speed = 4.0f; break; // lantern - faster rotation
-                case 1: speed = 2.5f; break; // pagoda - medium scale
-                case 2: speed = 3.5f; break; // statue - bouncy
-                case 3: speed = 2.0f; break; // weapon rack - color shift
+                case 0: speed = 4.0f; break;
+                case 1: speed = 2.5f; break;
+                case 2: speed = 3.5f; break;
+                case 3: speed = 2.0f; break;
                 default: speed = 2.0f; break;
             }
             platform.animationValue += speed;
@@ -839,7 +1020,6 @@ void update(int value) {
     }
     
     // Update player movement
-    // Allow player movement while PLAYING or after WIN (player retains control on win screen)
     if (gameState == PLAYING || gameState == WIN) {
         Vector3 newPos = playerPos;
         bool moved = false;
@@ -867,18 +1047,16 @@ void update(int value) {
         
         if (moved && !checkCollision(newPos)) {
             playerPos = newPos;
-            static int moveCounter = 0;
-            if (++moveCounter % 30 == 0) { // Print every 30 frames (0.5 seconds)
-                std::cout << "Player moved to: (" << playerPos.x << ", " << playerPos.y << ", " << playerPos.z << ")" << std::endl;
+            if (debugMode) {
+                gameLogger.logPlayerMovement(playerPos);
             }
         }
         
-        // Continue to allow collectible checks (optional) so HUD updates if items are collected after win
         checkCollectibles();
     }
     
     glutPostRedisplay();
-    glutTimerFunc(16, update, 0); // 60 FPS
+    glutTimerFunc(16, update, 0);
 }
 
 void keyboard(unsigned char key, int x, int y) {
@@ -891,6 +1069,13 @@ void keyboard(unsigned char key, int x, int y) {
     if (key == 'r' || key == 'R') {
         initGame();
         lastTime = glutGet(GLUT_ELAPSED_TIME);
+    }
+    
+    // Debug mode toggle
+    if (key == 'b' || key == 'B') {
+        debugMode = !debugMode;
+        gameLogger.log("DEBUG", debugMode ? "Debug mode ENABLED" : "Debug mode DISABLED");
+        std::cout << "Debug mode " << (debugMode ? "ON" : "OFF") << std::endl;
     }
     
     // Camera modes
@@ -911,7 +1096,7 @@ void keyboard(unsigned char key, int x, int y) {
     if (key == 'x' || key == 'X') {
         if (platforms.size() > 1 && platforms[1].allCollected) {
             platforms[1].animationActive = !platforms[1].animationActive;
-            std::cout << "P2 animation toggled to " << (platforms[1].animationActive ? "ON" : "OFF") << std::endl;
+            std::cout << "P2 animation toggled to " << (platforms[2].animationActive ? "ON" : "OFF") << std::endl;
         } else {
             std::cout << "P2 not complete yet. Collect all items to enable animation." << std::endl;
         }
@@ -1037,8 +1222,11 @@ int main(int argc, char** argv) {
     std::cout << "  3 - Front View" << std::endl;
     std::cout << "  0 - Free Camera (Mouse control)" << std::endl;
     std::cout << "  Z/X/C/V - Toggle animations (after collecting)" << std::endl;
+    std::cout << "  B - Toggle DEBUG mode (shows collection radius)" << std::endl;
     std::cout << "  R - Restart game" << std::endl;
     std::cout << "  ESC - Exit" << std::endl;
+    std::cout << "=============================" << std::endl;
+    std::cout << "Debug log saved to: game_debug.log" << std::endl;
     std::cout << "=============================" << std::endl;
     
     glutMainLoop();
